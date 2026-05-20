@@ -6,6 +6,30 @@ import os
 import random
 import string
 
+CHECKPOINT_FILE = "checkpoint.pt"
+BASIC_EXAMPLES = [
+    ("hello", "hello"),
+    ("hi", "hi"),
+    ("bye", "bye"),
+    ("yes", "yes means correct or okay"),
+    ("no", "no means not correct or stop"),
+    ("help", "help means ask for support"),
+    ("python", "python is a coding language"),
+    ("code", "code is instructions for a computer"),
+    ("function", "a function is reusable code"),
+    ("variable", "a variable stores a value"),
+    ("loop", "a loop repeats code"),
+    ("list", "a list stores many values"),
+    ("string", "a string is text"),
+    ("number", "a number is a value like 1 or 2"),
+    ("print", "print shows text on the screen"),
+    ("error", "an error means something went wrong"),
+    ("if", "if checks a condition"),
+    ("else", "else runs when if is false"),
+    ("return", "return sends a value back"),
+    ("add", "add means put numbers together"),
+]
+
 # ----------------------------
 # DATASET
 # ----------------------------
@@ -26,7 +50,7 @@ class Dataset:
             raise ValueError(f"{path} must contain a JSON list of training examples")
 
     def save(self):
-        with open(self.path, "w") as f:
+        with open(self.path, "w", newline="\n") as f:
             json.dump(self.data, f, indent=2)
 
     def add(self, prompt, response, score):
@@ -41,6 +65,29 @@ class Dataset:
         random.shuffle(self.data)
         for i in range(0, len(self.data), batch_size):
             yield self.data[i:i+batch_size]
+
+    def add_missing(self, examples):
+        existing = {
+            (item.get("prompt"), item.get("response"))
+            for item in self.data
+        }
+
+        added = 0
+        for prompt, response in examples:
+            if (prompt, response) in existing:
+                continue
+
+            self.data.append({
+                "prompt": prompt,
+                "response": response,
+                "score": 1
+            })
+            added += 1
+
+        if added:
+            self.save()
+
+        return added
 
 
 # ----------------------------
@@ -144,6 +191,20 @@ def generate(model, tok, prompt, max_len=40):
     return tok.decode(x[0].tolist())
 
 
+def basic_response(prompt):
+    words = prompt.lower().strip().split()
+    if not words:
+        return None
+
+    meanings = dict(BASIC_EXAMPLES)
+    for word in words:
+        cleaned = word.strip(string.punctuation)
+        if cleaned in meanings:
+            return meanings[cleaned]
+
+    return None
+
+
 def parse_rating(value):
     ratings = {
         "+": 1,
@@ -156,6 +217,23 @@ def parse_rating(value):
         "bad": -1
     }
     return ratings.get(value.strip().lower())
+
+
+def save_checkpoint(path, gpt, reward_model):
+    torch.save({
+        "gpt": gpt.state_dict(),
+        "reward_model": reward_model.state_dict()
+    }, path)
+
+
+def load_checkpoint(path, gpt, reward_model):
+    if not os.path.exists(path):
+        return False
+
+    checkpoint = torch.load(path, map_location="cpu")
+    gpt.load_state_dict(checkpoint["gpt"])
+    reward_model.load_state_dict(checkpoint["reward_model"])
+    return True
 
 
 # ----------------------------
@@ -258,15 +336,23 @@ def main():
     tok = CharTokenizer()
 
     dataset = Dataset("dataset.json")
+    added = dataset.add_missing(BASIC_EXAMPLES)
+    if added:
+        print("Added basic word examples:", added)
 
     gpt = TinyGPT(tok.vocab_size)
     reward_model = RewardModel(tok.vocab_size)
+
+    if load_checkpoint(CHECKPOINT_FILE, gpt, reward_model):
+        print("Loaded checkpoint.")
 
     print("Training GPT...")
     train_gpt(gpt, dataset, tok)
 
     print("Training Reward Model (RLHF)...")
     train_reward(reward_model, dataset, tok)
+    save_checkpoint(CHECKPOINT_FILE, gpt, reward_model)
+    print("Checkpoint saved.")
 
     while True:
         try:
@@ -278,7 +364,7 @@ def main():
         if not prompt:
             continue
 
-        out = generate(gpt, tok, prompt)
+        out = basic_response(prompt) or generate(gpt, tok, prompt)
         print("AI:", out)
 
         rating = input("Rate (+ good / 0 neutral / - bad / skip): ")
@@ -289,6 +375,12 @@ def main():
 
         dataset.add(prompt, out, score)
         print("feedback saved")
+
+        print("Training on feedback...")
+        train_gpt(gpt, dataset, tok, epochs=1)
+        train_reward(reward_model, dataset, tok, epochs=1)
+        save_checkpoint(CHECKPOINT_FILE, gpt, reward_model)
+        print("Checkpoint saved.")
 
 
 if __name__ == "__main__":
