@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import json
+import os
 import random
 
 # ----------------------------
@@ -10,8 +11,30 @@ import random
 
 class Dataset:
     def __init__(self, path="dataset.json"):
+        self.path = path
+
+        if not os.path.exists(path):
+            self.data = []
+            self.save()
+            return
+
         with open(path, "r") as f:
             self.data = json.load(f)
+
+        if not isinstance(self.data, list):
+            raise ValueError(f"{path} must contain a JSON list of training examples")
+
+    def save(self):
+        with open(self.path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def add(self, prompt, response, score):
+        self.data.append({
+            "prompt": prompt,
+            "response": response,
+            "score": score
+        })
+        self.save()
 
     def get_batches(self, batch_size=8):
         random.shuffle(self.data)
@@ -30,10 +53,11 @@ class CharTokenizer:
         self.itos = {i+1:c for i,c in enumerate(chars)}
         self.vocab_size = len(chars) + 1
 
-    def encode(self, text, max_len=64):
+    def encode(self, text, max_len=64, pad=True):
         x = [self.stoi.get(c, 0) for c in text.lower()]
         x = x[:max_len]
-        x += [0] * (max_len - len(x))
+        if pad:
+            x += [0] * (max_len - len(x))
         return torch.tensor(x)
 
     def decode(self, x):
@@ -45,13 +69,14 @@ class CharTokenizer:
 # ----------------------------
 
 class TinyGPT(nn.Module):
-    def __init__(self, vocab_size, d_model=128):
+    def __init__(self, vocab_size, d_model=128, max_len=64):
         super().__init__()
+        self.max_len = max_len
         self.emb = nn.Embedding(vocab_size, d_model)
-        self.pos = nn.Embedding(64, d_model)
+        self.pos = nn.Embedding(max_len, d_model)
 
         self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead=4),
+            nn.TransformerEncoderLayer(d_model, nhead=4, batch_first=True),
             num_layers=2
         )
 
@@ -59,11 +84,19 @@ class TinyGPT(nn.Module):
 
     def forward(self, x):
         B, T = x.shape
-        pos = torch.arange(T).unsqueeze(0).to(x.device)
+        if T > self.max_len:
+            x = x[:, -self.max_len:]
+            T = self.max_len
+
+        pos = torch.arange(T, device=x.device).unsqueeze(0)
+        mask = torch.triu(
+            torch.ones(T, T, device=x.device, dtype=torch.bool),
+            diagonal=1
+        )
 
         x = self.emb(x) + self.pos(pos)
 
-        x = self.transformer(x)
+        x = self.transformer(x, mask=mask)
         return self.fc(x)
 
 
@@ -83,7 +116,7 @@ class RewardModel(nn.Module):
 
     def forward(self, x):
         x = self.emb(x).mean(dim=1)
-        return self.fc(x).squeeze()
+        return self.fc(x).squeeze(-1)
 
 
 # ----------------------------
@@ -93,23 +126,45 @@ class RewardModel(nn.Module):
 def generate(model, tok, prompt, max_len=40):
     model.eval()
 
-    x = tok.encode(prompt).unsqueeze(0)
+    x = tok.encode(prompt, max_len=model.max_len, pad=False)
+    if x.numel() == 0:
+        x = torch.tensor([0])
+    x = x.unsqueeze(0)
 
-    for _ in range(max_len):
-        logits = model(x)
-        probs = torch.softmax(logits[:, -1, :], dim=-1)
-        next_id = torch.multinomial(probs, 1)
+    with torch.no_grad():
+        for _ in range(max_len):
+            logits = model(x[:, -model.max_len:])
+            probs = torch.softmax(logits[:, -1, :], dim=-1)
+            next_id = torch.multinomial(probs, 1)
 
-        x = torch.cat([x, next_id], dim=1)
+            x = torch.cat([x, next_id], dim=1)
 
     return tok.decode(x[0].tolist())
+
+
+def parse_rating(value):
+    ratings = {
+        "+": 1,
+        "1": 1,
+        "good": 1,
+        "0": 0,
+        "neutral": 0,
+        "-": -1,
+        "-1": -1,
+        "bad": -1
+    }
+    return ratings.get(value.strip().lower())
 
 
 # ----------------------------
 # TRAIN REWARD MODEL (your RLHF step)
 # ----------------------------
 
-def train_reward(model, reward_model, dataset, tok, epochs=5):
+def train_reward(reward_model, dataset, tok, epochs=5):
+    if not dataset.data:
+        print("reward training skipped: dataset is empty")
+        return
+
     opt = optim.Adam(reward_model.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
 
@@ -149,8 +204,12 @@ def train_reward(model, reward_model, dataset, tok, epochs=5):
 # ----------------------------
 
 def train_gpt(model, dataset, tok, epochs=5):
+    if not dataset.data:
+        print("gpt training skipped: dataset is empty")
+        return
+
     opt = optim.Adam(model.parameters(), lr=3e-4)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
     for epoch in range(epochs):
         total = 0
@@ -161,10 +220,11 @@ def train_gpt(model, dataset, tok, epochs=5):
             y_list = []
 
             for item in batch:
-                text = item["prompt"] + item["response"]
+                text = item["prompt"] + " " + item["response"]
+                encoded = tok.encode(text, max_len=model.max_len + 1)
 
-                x = tok.encode(text)
-                y = tok.encode(text)
+                x = encoded[:-1]
+                y = encoded[1:]
 
                 x_list.append(x)
                 y_list.append(y)
@@ -206,11 +266,27 @@ def main():
     print("Training Reward Model (RLHF)...")
     train_reward(reward_model, dataset, tok)
 
-    # test
     while True:
-        prompt = input("\nYou: ")
+        try:
+            prompt = input("\nYou: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nbye")
+            break
+
+        if not prompt:
+            continue
+
         out = generate(gpt, tok, prompt)
         print("AI:", out)
+
+        rating = input("Rate (+ good / 0 neutral / - bad / skip): ")
+        score = parse_rating(rating)
+        if score is None:
+            print("feedback skipped")
+            continue
+
+        dataset.add(prompt, out, score)
+        print("feedback saved")
 
 
 if __name__ == "__main__":
