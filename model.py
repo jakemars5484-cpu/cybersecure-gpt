@@ -4,6 +4,7 @@ import torch.optim as optim
 import json
 import os
 import random
+import string
 
 # ----------------------------
 # DATASET
@@ -48,13 +49,13 @@ class Dataset:
 
 class CharTokenizer:
     def __init__(self):
-        chars = list("abcdefghijklmnopqrstuvwxyz0123456789 .,!?")
+        chars = list(string.printable)
         self.stoi = {c:i+1 for i,c in enumerate(chars)}
         self.itos = {i+1:c for i,c in enumerate(chars)}
         self.vocab_size = len(chars) + 1
 
     def encode(self, text, max_len=64, pad=True):
-        x = [self.stoi.get(c, 0) for c in text.lower()]
+        x = [self.stoi.get(c, 0) for c in text]
         x = x[:max_len]
         if pad:
             x += [0] * (max_len - len(x))
@@ -134,6 +135,7 @@ def generate(model, tok, prompt, max_len=40):
     with torch.no_grad():
         for _ in range(max_len):
             logits = model(x[:, -model.max_len:])
+            logits[:, -1, 0] = float("-inf")
             probs = torch.softmax(logits[:, -1, :], dim=-1)
             next_id = torch.multinomial(probs, 1)
 
@@ -268,7 +270,7 @@ def main():
 
     while True:
         try:
-            prompt = input("\nYou: ").strip()
+            prompt = input("\nYou: ")
         except (EOFError, KeyboardInterrupt):
             print("\nbye")
             break
